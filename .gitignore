@@ -17,3 +17,5 @@ t.ann
 x.tree
 test.tree
 foo.idx
+
+cmake-build-*
