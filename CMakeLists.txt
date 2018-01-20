@@ -5,8 +5,9 @@ set(CMAKE_CXX_STANDARD 11)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY bin)
 
-add_executable(annoy-on-rocksdb
-        src/annoyrocksdblib.h
-        test/annoy-on-rocksdb.cpp)
+add_executable(test-annoy
+        src/annoylib.h
+        src/experimental/annoylib.h
+        test/experimental/test.cpp)
 
-target_link_libraries(annoy-on-rocksdb rocksdb)
+target_link_libraries(test-annoy rocksdb)
