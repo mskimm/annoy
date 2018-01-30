@@ -573,54 +573,202 @@ class AnnoyIndexInterface {
   virtual void set_seed(int q) = 0;
 };
 
-template<typename S, typename T, typename Distance, typename Random>
-  class AnnoyIndex : public AnnoyIndexInterface<S, T> {
-  /*
-   * We use random projection to build a forest of binary trees of all items.
-   * Basically just split the hyperspace into two sides by a hyperplane,
-   * then recursively split each of those subtrees etc.
-   * We create a tree like this q times. The default q is determined automatically
-   * in such a way that we at most use 2x as much memory as the vectors take.
-   */
+template<typename S, typename T, typename Distance>
+class AnnoyStorageInterface {
+
 public:
-  typedef Distance D;
-  typedef typename D::template Node<S, T> Node;
+
+  typedef typename Distance::template Node<S, T> Node;
+
+  virtual ~AnnoyStorageInterface() {}
+
+  virtual void add_item(S item, const T* w) {
+    showUpdate("add_item is not supported\n");
+  }
+
+  virtual bool is_mutable() {
+    return false;
+  }
+
+  virtual S append_node(const vector<S>& indices) {
+    showUpdate("append_node is not supported\n");
+    return -1;
+  }
+
+  virtual S append_node(const Node* node) {
+    showUpdate("append_node is not supported\n");
+    return -1;
+  }
+
+  virtual bool save(const char *filename) {
+    showUpdate("save is not supported\n");
+    return false;
+  }
+
+  virtual bool load(const char* filename, vector<S>& roots) {
+    showUpdate("load is not supported\n");
+    return false;
+  }
+
+  virtual void set_roots(vector<S>& roots) {
+    showUpdate("set_roots is not supported\n");
+  }
+
+  virtual Node* alloc_node() {
+    showUpdate("alloc_node is not supported\n");
+    return NULL;
+  }
+
+  virtual void free_node(Node *n) {
+    showUpdate("free_node is not supported\n");
+  }
+
+  virtual void unload() = 0;
+  virtual Node *ref_node(S i) = 0;
+  virtual void unref_node(Node *n) = 0;
+  virtual void get_item(S item, T* v) = 0;
+  virtual S get_n_items() = 0;
+  virtual S get_n_nodes() = 0;
+  virtual S max_descendants() = 0;
+};
+
+template<typename S, typename T, typename Distance>
+class MemoryStorage : public AnnoyStorageInterface<S, T, Distance> {
 
 protected:
+
+  typedef typename Distance::template Node<S, T> Node;
+
   const int _f;
   size_t _s;
-  S _n_items;
-  Random _random;
+  S _K;
   void* _nodes; // Could either be mmapped, or point to a memory buffer that we reallocate
   S _n_nodes;
   S _nodes_size;
-  vector<S> _roots;
-  S _K;
-  bool _loaded;
+  S _n_items;
   bool _verbose;
-  int _fd;
+
 public:
 
-  AnnoyIndex(int f) : _f(f), _random() {
+  MemoryStorage(int f) : _f(f) {
     _s = offsetof(Node, v) + f * sizeof(T); // Size of each node
-    _verbose = false;
     _K = (_s - offsetof(Node, children)) / sizeof(S); // Max number of descendants to fit into node
-    reinitialize(); // Reset everything
-  }
-  ~AnnoyIndex() {
-    unload();
+    _verbose = false;
+    reinitialize();
   }
 
-  int get_f() const {
-    return _f;
+  void add_item(S item, const T *w) override {
+    _add_item(item, w);
   }
 
-  void add_item(S item, const T* w) {
-    add_item_impl(item, w);
+  bool is_mutable() override {
+    return true;
+  }
+
+  S append_node(const Node *node) override {
+    S i = _n_nodes++;
+    _allocate_size(i + 1);
+    memcpy(_get(i), node, _s);
+    return i;
+  }
+
+  S append_node(const vector<S> &indices) override {
+    S i = _n_nodes++;
+    _allocate_size(i + 1);
+    Node *m = _get(i);
+    m->n_descendants = (S) indices.size();
+
+    // Using std::copy instead of a loop seems to resolve issues #3 and #13,
+    // probably because gcc 4.8 goes overboard with optimizations.
+    // Using memcpy instead of std::copy for MSVC compatibility. #235
+    memcpy(m->children, &indices[0], indices.size() * sizeof(S));
+    return i;
+  }
+
+  bool save(const char *filename) override {
+    FILE *f = fopen(filename, "wb");
+    if (f == NULL)
+      return false;
+
+    fwrite(_nodes, _s, _n_nodes, f);
+    fclose(f);
+    return true;
+  }
+
+  void set_roots(vector<S> &roots) override {
+    // Also, copy the roots into the last segment of the array
+    // This way we can load them faster without reading the whole file
+    _allocate_size(_n_nodes + (S)roots.size());
+    for (size_t i = 0; i < roots.size(); i++)
+      memcpy(_get(_n_nodes + (S)i), _get(roots[i]), _s);
+    _n_nodes += roots.size();
+  }
+
+  Node *alloc_node() override {
+    return (Node *)malloc(_s);
+  }
+
+  void free_node(Node *n) override {
+    free(n);
+  }
+
+  void unload() override {
+    if (_nodes)
+      free(_nodes);
+    reinitialize();
+    if (_verbose) showUpdate("unloaded\n");
+  }
+
+  Node *ref_node(S i) override {
+    return _get(i);
+  }
+
+  void unref_node(Node *node) override {}
+
+  void get_item(S item, T *v) override {
+    Node* m = _get(item);
+    memcpy(v, m->v, _f * sizeof(T));
+  }
+
+  S get_n_items() override {
+    return _n_items;
+  }
+
+  S get_n_nodes() override {
+    return _n_nodes;
+  }
+
+  S max_descendants() override {
+    return _K;
+  }
+
+protected:
+
+  void reinitialize() {
+    _nodes = NULL;
+    _n_items = 0;
+    _n_nodes = 0;
+    _nodes_size = 0;
+  }
+
+  void _allocate_size(S n) {
+    if (n > _nodes_size) {
+      const double reallocation_factor = 1.3;
+      S new_nodes_size = std::max(n,
+                                  (S)((_nodes_size + 1) * reallocation_factor));
+      if (_verbose) showUpdate("Reallocating to %d nodes\n", new_nodes_size);
+      _nodes = realloc(_nodes, _s * new_nodes_size);
+      memset((char *)_nodes + (_nodes_size * _s)/sizeof(char), 0, (new_nodes_size - _nodes_size) * _s);
+      _nodes_size = new_nodes_size;
+    }
+  }
+
+  inline Node* _get(S i) {
+    return (Node*)((uint8_t *)_nodes + (_s * i));
   }
 
   template<typename W>
-  void add_item_impl(S item, const W& w) {
+  void _add_item(S item, const W& w) {
     _allocate_size(item + 1);
     Node* n = _get(item);
 
@@ -633,87 +781,39 @@ public:
 
     if (item >= _n_items)
       _n_items = item + 1;
+
+    if (_n_items > _n_nodes)
+      _n_nodes = _n_items;
   }
 
-  void build(int q) {
-    if (_loaded) {
-      // TODO: throw exception
-      showUpdate("You can't build a loaded index\n");
-      return;
-    }
-    _n_nodes = _n_items;
-    while (1) {
-      if (q == -1 && _n_nodes >= _n_items * 2)
-        break;
-      if (q != -1 && _roots.size() >= (size_t)q)
-        break;
-      if (_verbose) showUpdate("pass %zd...\n", _roots.size());
+};
 
-      vector<S> indices;
-      for (S i = 0; i < _n_items; i++) {
-	if (_get(i)->n_descendants >= 1) // Issue #223
-          indices.push_back(i);
-      }
+template<typename S, typename T, typename Distance>
+class MMapStorage : public AnnoyStorageInterface<S, T, Distance> {
 
-      _roots.push_back(_make_tree(indices));
-    }
-    // Also, copy the roots into the last segment of the array
-    // This way we can load them faster without reading the whole file
-    _allocate_size(_n_nodes + (S)_roots.size());
-    for (size_t i = 0; i < _roots.size(); i++)
-      memcpy(_get(_n_nodes + (S)i), _get(_roots[i]), _s);
-    _n_nodes += _roots.size();
+protected:
+  typedef typename Distance::template Node<S, T> Node;
 
-    if (_verbose) showUpdate("has %d nodes\n", _n_nodes);
-  }
-  
-  void unbuild() {
-    if (_loaded) {
-      showUpdate("You can't unbuild a loaded index\n");
-      return;
-    }
+  const int _f;
+  size_t _s;
+  S _K;
+  void* _nodes; // Could either be mmapped, or point to a memory buffer that we reallocate
+  S _n_nodes;
+  S _nodes_size;
+  S _n_items;
+  bool _verbose;
 
-    _roots.clear();
-    _n_nodes = _n_items;
-  }
+  int _fd;
+public:
 
-  bool save(const char* filename) {
-    FILE *f = fopen(filename, "wb");
-    if (f == NULL)
-      return false;
-
-    fwrite(_nodes, _s, _n_nodes, f);
-    fclose(f);
-
-    unload();
-    return load(filename);
-  }
-
-  void reinitialize() {
-    _fd = 0;
-    _nodes = NULL;
-    _loaded = false;
-    _n_items = 0;
-    _n_nodes = 0;
-    _nodes_size = 0;
-    _roots.clear();
-  }
-
-  void unload() {
-    if (_fd) {
-      // we have mmapped data
-      close(_fd);
-      off_t size = _n_nodes * _s;
-      munmap(_nodes, size);
-    } else if (_nodes) {
-      // We have heap allocated data
-      free(_nodes);
-    }
+  MMapStorage(int f) : _f(f) {
+    _s = offsetof(Node, v) + f * sizeof(T); // Size of each node
+    _K = (_s - offsetof(Node, children)) / sizeof(S); // Max number of descendants to fit into node
+    _verbose = false;
     reinitialize();
-    if (_verbose) showUpdate("unloaded\n");
   }
 
-  bool load(const char* filename) {
+  bool load(const char *filename, vector<S> &roots) override {
     _fd = open(filename, O_RDONLY, (int)0400);
     if (_fd == -1) {
       _fd = 0;
@@ -731,50 +831,216 @@ public:
     _n_nodes = (S)(size / _s);
 
     // Find the roots by scanning the end of the file and taking the nodes with most descendants
-    _roots.clear();
+    roots.clear();
     S m = -1;
     for (S i = _n_nodes - 1; i >= 0; i--) {
       S k = _get(i)->n_descendants;
       if (m == -1 || k == m) {
-        _roots.push_back(i);
+        roots.push_back(i);
         m = k;
       } else {
         break;
       }
     }
     // hacky fix: since the last root precedes the copy of all roots, delete it
-    if (_roots.size() > 1 && _get(_roots.front())->children[0] == _get(_roots.back())->children[0])
-      _roots.pop_back();
-    _loaded = true;
+    if (roots.size() > 1 && _get(roots.front())->children[0] == _get(roots.back())->children[0])
+      roots.pop_back();
     _n_items = m;
-    if (_verbose) showUpdate("found %lu roots with degree %d\n", _roots.size(), m);
+    if (_verbose) showUpdate("found %lu roots with degree %d\n", roots.size(), m);
     return true;
   }
 
+  void unload() override {
+    if (_fd) {
+      close(_fd);
+      off_t size = _n_nodes * _s;
+      munmap(_nodes, size);
+    }
+
+    reinitialize();
+    if (_verbose) showUpdate("unloaded\n");
+  }
+
+  Node *ref_node(S i) override {
+    return _get(i);
+  }
+
+  void unref_node(Node *node) override {}
+
+  void get_item(S item, T *v) override {
+    Node* m = _get(item);
+    memcpy(v, m->v, _f * sizeof(T));
+  }
+
+  S get_n_items() override {
+    return _n_items;
+  }
+
+  S get_n_nodes() override {
+    return _n_nodes;
+  }
+
+  S max_descendants() override {
+    return _K;
+  }
+
+protected:
+
+  void reinitialize() {
+    _fd = 0;
+    _nodes = NULL;
+    _n_items = 0;
+    _n_nodes = 0;
+    _nodes_size = 0;
+  }
+
+  inline Node* _get(S i) {
+    return (Node*)((uint8_t *)_nodes + (_s * i));
+  }
+
+};
+
+template<typename S, typename T, typename Distance, typename Random>
+class AnnoyIndex : public AnnoyIndexInterface<S, T> {
+  /*
+   * We use random projection to build a forest of binary trees of all items.
+   * Basically just split the hyperspace into two sides by a hyperplane,
+   * then recursively split each of those subtrees etc.
+   * We create a tree like this q times. The default q is determined automatically
+   * in such a way that we at most use 2x as much memory as the vectors take.
+   */
+public:
+  typedef Distance D;
+  typedef typename D::template Node<S, T> Node;
+
+protected:
+  const int _f;
+  Random _random;
+  vector<S> _roots;
+  bool _verbose;
+
+  // for backward compatibility
+  MemoryStorage<S, T, Distance> _memory_storage;
+  MMapStorage<S, T, Distance> _mmap_storage;
+
+  AnnoyStorageInterface<S, T, Distance>* _storage;
+
+public:
+
+  AnnoyIndex(int f)
+      : _f(f), _random(), _memory_storage(f), _mmap_storage(f),
+        _storage(&_memory_storage) {
+    _verbose = false;
+  }
+
+  AnnoyIndex(int f, AnnoyStorageInterface<S, T, Distance>* storage)
+      : _f(f), _random(), _memory_storage(f), _mmap_storage(f),
+        _storage(storage) {
+    _verbose = false;
+  }
+
+  ~AnnoyIndex() {
+    unload();
+  }
+
+  int get_f() const {
+    return _f;
+  }
+
+  void add_item(S item, const T* w) {
+    _storage->add_item(item, w);
+  }
+
+  void build(int q) {
+    if (!_storage->is_mutable()) {
+      // TODO: throw exception
+      showUpdate("You can't build a loaded index\n");
+      return;
+    }
+
+    S n_items = _storage->get_n_items();
+    S n_nodes = _storage->get_n_nodes();
+    while (1) {
+      n_nodes = _storage->get_n_nodes();
+      if (q == -1 && n_nodes >= n_items * 2)
+        break;
+      if (q != -1 && _roots.size() >= (size_t)q)
+        break;
+      if (_verbose) showUpdate("pass %zd...\n", _roots.size());
+
+      vector<S> indices;
+      Node *n;
+      for (S i = 0; i < n_items; i++) {
+        // if storage exists, the hole will be treated in `_make_tree`
+        n = _storage->ref_node(i);
+        if (n->n_descendants >= 1) // Issue #223
+          indices.push_back(i);
+        _storage->unref_node(n);
+      }
+
+      _roots.push_back(_make_tree(indices));
+    }
+
+    _storage->set_roots(_roots);
+
+    if (_verbose) showUpdate("has %d nodes\n", _storage->get_n_nodes());
+  }
+  
+  void unbuild() {
+    if (!_storage->is_mutable()) {
+      showUpdate("You can't unbuild a loaded index\n");
+      return;
+    }
+
+    _roots.clear();
+  }
+
+  bool save(const char* filename) {
+    if (_storage == &_memory_storage) {
+      _storage->save(filename);
+      _storage->unload();
+      _storage = &_mmap_storage;
+      return load(filename);
+    } else {
+      return false;
+    }
+  }
+
+  void unload() {
+    _storage->unload();
+  }
+
+  bool load(const char* filename) {
+    return _storage->load(filename, _roots);
+  }
+
   T get_distance(S i, S j) {
-    const T* x = _get(i)->v;
-    const T* y = _get(j)->v;
-    return D::normalized_distance(D::distance(x, y, _f));
+    Node* x = _storage->ref_node(i);
+    Node* y = _storage->ref_node(j);
+    T distance = D::normalized_distance(D::distance(x->v, y->v, _f));
+    _storage->unref_node(x);
+    _storage->unref_node(y);
+    return distance;
   }
 
   void get_nns_by_item(S item, size_t n, size_t search_k, vector<S>* result, vector<T>* distances) {
-    const Node* m = _get(item);
+    Node* m = _storage->ref_node(item);
     _get_all_nns(m->v, n, search_k, result, distances);
+    _storage->unref_node(m);
   }
 
   void get_nns_by_vector(const T* w, size_t n, size_t search_k, vector<S>* result, vector<T>* distances) {
     _get_all_nns(w, n, search_k, result, distances);
   }
   S get_n_items() {
-    return _n_items;
+    return _storage->get_n_items();
   }
   void verbose(bool v) {
     _verbose = v;
   }
 
   void get_item(S item, T* v) {
-    Node* m = _get(item);
-    memcpy(v, m->v, _f * sizeof(T));
+    _storage->get_item(item, v);
   }
 
   void set_seed(int seed) {
@@ -782,59 +1048,39 @@ public:
   }
 
 protected:
-  void _allocate_size(S n) {
-    if (n > _nodes_size) {
-      const double reallocation_factor = 1.3;
-      S new_nodes_size = std::max(n,
-				  (S)((_nodes_size + 1) * reallocation_factor));
-      if (_verbose) showUpdate("Reallocating to %d nodes\n", new_nodes_size);
-      _nodes = realloc(_nodes, _s * new_nodes_size);
-      memset((char *)_nodes + (_nodes_size * _s)/sizeof(char), 0, (new_nodes_size - _nodes_size) * _s);
-      _nodes_size = new_nodes_size;
-    }
-  }
-
-  inline Node* _get(S i) {
-    return (Node*)((uint8_t *)_nodes + (_s * i));
-  }
 
   S _make_tree(const vector<S >& indices) {
     if (indices.size() == 1)
       return indices[0];
 
-    if (indices.size() <= (size_t)_K) {
-      _allocate_size(_n_nodes + 1);
-      S item = _n_nodes++;
-      Node* m = _get(item);
-      m->n_descendants = (S)indices.size();
+    if (indices.size() <= (size_t)_storage->max_descendants())
+      return _storage->append_node(indices);
 
-      // Using std::copy instead of a loop seems to resolve issues #3 and #13,
-      // probably because gcc 4.8 goes overboard with optimizations.
-      // Using memcpy instead of std::copy for MSVC compatibility. #235
-      memcpy(m->children, &indices[0], indices.size() * sizeof(S));
-      return item;
-    }
-
+    vector<Node*> children_ref;
     vector<Node*> children;
     for (size_t i = 0; i < indices.size(); i++) {
       S j = indices[i];
-      Node* n = _get(j);
+      Node *n = _storage->ref_node(j);
+      children_ref.push_back(n);
       if (n)
         children.push_back(n);
     }
 
     vector<S> children_indices[2];
-    Node* m = (Node*)malloc(_s); // TODO: avoid
+    Node* m = _storage->alloc_node(); // TODO: avoid
     D::create_split(children, _f, _random, m);
 
     for (size_t i = 0; i < indices.size(); i++) {
       S j = indices[i];
-      Node* n = _get(j);
+      Node *n = children_ref[i];
       if (n) {
         bool side = D::side(m, n->v, _f, _random);
         children_indices[side].push_back(j);
       }
     }
+
+    for (size_t i = 0; i < children_ref.size(); i++)
+      _storage->unref_node(children_ref[i]);
 
     // If we didn't find a hyperplane, just randomize sides as a last option
     while (children_indices[0].size() == 0 || children_indices[1].size() == 0) {
@@ -862,11 +1108,8 @@ protected:
       // run _make_tree for the smallest child first (for cache locality)
       m->children[side^flip] = _make_tree(children_indices[side^flip]);
 
-    _allocate_size(_n_nodes + 1);
-    S item = _n_nodes++;
-    memcpy(_get(item), m, _s);
-    free(m);
-
+    S item = _storage->append_node(m);
+    _storage->free_node(m);
     return item;
   }
 
@@ -880,16 +1123,18 @@ protected:
       q.push(make_pair(Distance::template pq_initial_value<T>(), _roots[i]));
     }
 
+    S n_items = _storage->get_n_items();
+    S K = _storage->max_descendants();
     vector<S> nns;
     while (nns.size() < search_k && !q.empty()) {
       const pair<T, S>& top = q.top();
       T d = top.first;
       S i = top.second;
-      Node* nd = _get(i);
+      Node* nd = _storage->ref_node(i);
       q.pop();
-      if (nd->n_descendants == 1 && i < _n_items) {
+      if (nd->n_descendants == 1 && i < n_items) {
         nns.push_back(i);
-      } else if (nd->n_descendants <= _K) {
+      } else if (nd->n_descendants <= K) {
         const S* dst = nd->children;
         nns.insert(nns.end(), dst, &dst[nd->n_descendants]);
       } else {
@@ -897,6 +1142,7 @@ protected:
         q.push(make_pair(D::pq_distance(d, margin, 1), nd->children[1]));
         q.push(make_pair(D::pq_distance(d, margin, 0), nd->children[0]));
       }
+      _storage->unref_node(nd);
     }
 
     // Get distances for all items
@@ -909,7 +1155,9 @@ protected:
       if (j == last)
         continue;
       last = j;
-      nns_dist.push_back(make_pair(D::distance(v, _get(j)->v, _f), j));
+      Node *n = _storage->ref_node(j);
+      nns_dist.push_back(make_pair(D::distance(v, n->v, _f), j));
+      _storage->unref_node(n);
     }
 
     size_t m = nns_dist.size();
