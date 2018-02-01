@@ -581,48 +581,17 @@ public:
   typedef typename Distance::template Node<S, T> Node;
 
   virtual ~AnnoyStorageInterface() {}
+  virtual void add_item(S item, const T* w) {}
+  virtual bool is_mutable() { return false; }
+  virtual S append_node(const vector<S>& indices) { return -1; }
+  virtual S append_node(const Node* node) { return -1; }
+  virtual bool save(const char *filename) { return false; }
+  virtual bool load(vector<S>& roots) { return false; }
+  virtual void set_roots(vector<S>& roots) {}
+  virtual Node* alloc_node() { return NULL; }
+  virtual void free_node(Node *n) {}
 
-  virtual void add_item(S item, const T* w) {
-    showUpdate("add_item is not supported\n");
-  }
-
-  virtual bool is_mutable() {
-    return false;
-  }
-
-  virtual S append_node(const vector<S>& indices) {
-    showUpdate("append_node is not supported\n");
-    return -1;
-  }
-
-  virtual S append_node(const Node* node) {
-    showUpdate("append_node is not supported\n");
-    return -1;
-  }
-
-  virtual bool save(const char *filename) {
-    showUpdate("save is not supported\n");
-    return false;
-  }
-
-  virtual bool load(const char* filename, vector<S>& roots) {
-    showUpdate("load is not supported\n");
-    return false;
-  }
-
-  virtual void set_roots(vector<S>& roots) {
-    showUpdate("set_roots is not supported\n");
-  }
-
-  virtual Node* alloc_node() {
-    showUpdate("alloc_node is not supported\n");
-    return NULL;
-  }
-
-  virtual void free_node(Node *n) {
-    showUpdate("free_node is not supported\n");
-  }
-
+  // pure virtual
   virtual void unload() = 0;
   virtual Node *ref_node(S i) = 0;
   virtual void unref_node(Node *n) = 0;
@@ -804,17 +773,26 @@ protected:
   bool _verbose;
 
   int _fd;
+  const char* _filename;
 public:
 
-  MMapStorage(int f) : _f(f) {
+  MMapStorage(int f, const char *filename) : _f(f), _filename(filename) {
     _s = offsetof(Node, v) + f * sizeof(T); // Size of each node
     _K = (_s - offsetof(Node, children)) / sizeof(S); // Max number of descendants to fit into node
     _verbose = false;
     reinitialize();
   }
 
-  bool load(const char *filename, vector<S> &roots) override {
-    _fd = open(filename, O_RDONLY, (int)0400);
+  void set_filename(const char *filename) {
+    _filename = filename;
+  }
+
+  bool load(vector<S> &roots) override {
+
+    if (!_filename)
+      return false;
+
+    _fd = open(_filename, O_RDONLY, (int)0400);
     if (_fd == -1) {
       _fd = 0;
       return false;
@@ -928,15 +906,17 @@ protected:
 public:
 
   AnnoyIndex(int f)
-      : _f(f), _random(), _memory_storage(f), _mmap_storage(f),
+      : _f(f), _random(), _memory_storage(f), _mmap_storage(f, NULL),
         _storage(&_memory_storage) {
     _verbose = false;
+    _storage->load(_roots);
   }
 
   AnnoyIndex(int f, AnnoyStorageInterface<S, T, Distance>* storage)
-      : _f(f), _random(), _memory_storage(f), _mmap_storage(f),
+      : _f(f), _random(), _memory_storage(f), _mmap_storage(f, NULL),
         _storage(storage) {
     _verbose = false;
+    _storage->load(_roots);
   }
 
   ~AnnoyIndex() {
@@ -961,7 +941,6 @@ public:
     S n_items = _storage->get_n_items();
     S n_nodes = _storage->get_n_nodes();
     while (1) {
-      n_nodes = _storage->get_n_nodes();
       if (q == -1 && n_nodes >= n_items * 2)
         break;
       if (q != -1 && _roots.size() >= (size_t)q)
@@ -979,6 +958,7 @@ public:
       }
 
       _roots.push_back(_make_tree(indices));
+      n_nodes = _storage->get_n_nodes();
     }
 
     _storage->set_roots(_roots);
@@ -1007,11 +987,17 @@ public:
   }
 
   void unload() {
-    _storage->unload();
+    _memory_storage.unload();
+    _mmap_storage.unload();
   }
 
   bool load(const char* filename) {
-    return _storage->load(filename, _roots);
+    if (_storage == &_mmap_storage) {
+      _mmap_storage.set_filename(filename);
+      return _storage->load(_roots);
+    } else {
+      return false;
+    }
   }
 
   T get_distance(S i, S j) {
